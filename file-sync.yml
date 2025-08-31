@@ -1,0 +1,171 @@
+name: Generic file sync (template)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: "Newline-separated list of source file paths or wildcards (runner paths)"
+        required: false
+        type: string
+      dest-dir:
+        description: "Destination directory in repo (relative)"
+        required: false
+        default: "docs"
+        type: string
+      preserve-dirs:
+        description: "Preserve directory structure relative to base-dir (true/false)"
+        required: false
+        default: "false"
+        type: string
+      base-dir:
+        description: "Base directory to strip when preserving structure"
+        required: false
+        type: string
+      commit:
+        description: "Commit and open/update PR (true/false)"
+        required: false
+        default: "false"
+        type: string
+      pr-branch:
+        description: "PR branch name (when commit=true)"
+        required: false
+        default: "file-sync"
+        type: string
+      pr-title:
+        description: "PR title prefix"
+        required: false
+        default: "File sync update"
+        type: string
+      pr-body-extra:
+        description: "Extra body text appended to PR description"
+        required: false
+        type: string
+  schedule:
+    - cron: "0 6 * * 1" # Mondays at 06:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: windows-latest
+    env:
+      INPUT_SOURCES: "${{ inputs.sources }}"
+      INPUT_DEST_DIR: "${{ inputs['dest-dir'] }}"
+      INPUT_PRESERVE_DIRS: "${{ inputs['preserve-dirs'] }}"
+      INPUT_BASE_DIR: "${{ inputs['base-dir'] }}"
+      INPUT_COMMIT_FILES: "${{ inputs.commit }}"
+      INPUT_PR_BRANCH: "${{ inputs['pr-branch'] }}"
+      INPUT_PR_TITLE: "${{ inputs['pr-title'] }}"
+      INPUT_PR_BODY_EXTRA: "${{ inputs['pr-body-extra'] }}"
+      SYNC_SOURCES: "${{ vars.SYNC_SOURCES }}"
+      FILE_SYNC_DEST_DIR: "${{ vars.FILE_SYNC_DEST_DIR }}"
+      FILE_SYNC_PRESERVE_DIRS: "${{ vars.FILE_SYNC_PRESERVE_DIRS }}"
+      FILE_SYNC_BASE_DIR: "${{ vars.FILE_SYNC_BASE_DIR }}"
+      FILE_SYNC_COMMIT: "${{ vars.FILE_SYNC_COMMIT }}"
+      FILE_SYNC_PR_BRANCH: "${{ vars.FILE_SYNC_PR_BRANCH }}"
+      FILE_SYNC_PR_TITLE: "${{ vars.FILE_SYNC_PR_TITLE }}"
+      FILE_SYNC_PR_BODY_EXTRA: "${{ vars.FILE_SYNC_PR_BODY_EXTRA }}"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve sources and detect changes
+        id: detect
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          function Resolve-Setting {
+            param([string]$Primary,[string]$FallbackName)
+            if (-not [string]::IsNullOrWhiteSpace($Primary)) { return $Primary }
+            return (Get-Item -Path Env:$FallbackName -ErrorAction SilentlyContinue).Value
+          }
+          $syncSources   = Resolve-Setting $env:INPUT_SOURCES 'SYNC_SOURCES'
+          $destDir       = Resolve-Setting $env:INPUT_DEST_DIR 'FILE_SYNC_DEST_DIR'
+          $preserveDirs  = Resolve-Setting $env:INPUT_PRESERVE_DIRS 'FILE_SYNC_PRESERVE_DIRS'
+          $baseDir       = Resolve-Setting $env:INPUT_BASE_DIR 'FILE_SYNC_BASE_DIR'
+          $commitMode    = Resolve-Setting $env:INPUT_COMMIT_FILES 'FILE_SYNC_COMMIT'
+          $prBranch      = Resolve-Setting $env:INPUT_PR_BRANCH 'FILE_SYNC_PR_BRANCH'
+          $prTitlePrefix = Resolve-Setting $env:INPUT_PR_TITLE 'FILE_SYNC_PR_TITLE'
+          $prBodyExtra   = Resolve-Setting $env:INPUT_PR_BODY_EXTRA 'FILE_SYNC_PR_BODY_EXTRA'
+          if ([string]::IsNullOrWhiteSpace($destDir)) { $destDir = 'docs' }
+          if ([string]::IsNullOrWhiteSpace($prBranch)) { $prBranch = 'file-sync' }
+          if ([string]::IsNullOrWhiteSpace($prTitlePrefix)) { $prTitlePrefix = 'File sync update' }
+          "resolved_commit=$commitMode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "resolved_pr_branch=$prBranch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "resolved_pr_title_prefix=$prTitlePrefix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($prBodyExtra) { "resolved_pr_body_extra=$prBodyExtra" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8 }
+          if ([string]::IsNullOrWhiteSpace($syncSources)) {
+            Write-Host 'No sources provided.'; "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8; exit 0 }
+          $lines = $syncSources -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          $sourceFiles = New-Object System.Collections.Generic.HashSet[string]
+          foreach ($pattern in $lines) {
+            if ($pattern -match '[*?]') {
+              Get-ChildItem -Path $pattern -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object { [void]$sourceFiles.Add($_.FullName) }
+            } elseif (Test-Path $pattern) {
+              [void]$sourceFiles.Add((Resolve-Path $pattern).Path)
+            }
+          }
+          if ($sourceFiles.Count -eq 0) { Write-Host 'No files matched.'; "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8; exit 0 }
+          $stageRoot = Join-Path $env:GITHUB_WORKSPACE 'file-sync-stage'; New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+          $changedRelPaths = New-Object System.Collections.Generic.List[string]; $changedCount = 0
+          foreach ($srcPath in $sourceFiles) {
+            $relDest = ''
+            if ($preserveDirs -eq 'true' -and -not [string]::IsNullOrWhiteSpace($baseDir)) {
+              $baseDirFull = [System.IO.Path]::GetFullPath($baseDir)
+              $srcFull = [System.IO.Path]::GetFullPath($srcPath)
+              if ($srcFull.StartsWith($baseDirFull,[System.StringComparison]::OrdinalIgnoreCase)) {
+                $rel = $srcFull.Substring($baseDirFull.Length).TrimStart('\\','/') -replace '\\','/'
+                $relDest = (Join-Path $destDir $rel) -replace '\\','/'
+              }
+            }
+            if ([string]::IsNullOrWhiteSpace($relDest)) { $relDest = (Join-Path $destDir (Split-Path $srcPath -Leaf)) -replace '\\','/' }
+            $repoDest = Join-Path $env:GITHUB_WORKSPACE $relDest
+            $needsCopy = -not (Test-Path $repoDest) -or ((Get-FileHash $srcPath -Algorithm SHA256).Hash -ne (Get-FileHash $repoDest -Algorithm SHA256).Hash)
+            if ($needsCopy) {
+              $stageDest = Join-Path $stageRoot $relDest; $dir = Split-Path $stageDest -Parent; if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+              Copy-Item -Path $srcPath -Destination $stageDest -Force
+              $changedRelPaths.Add($relDest) | Out-Null; $changedCount++
+            }
+          }
+          if ($changedCount -eq 0) { Write-Host 'No file changes detected.'; "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8; exit 0 }
+          "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "changed_paths=$($changedRelPaths -join "`n")" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "changed_count=$changedCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload synced files artifact
+        if: steps.detect.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: synced-files
+          path: file-sync-stage
+
+      - name: Stage files into repo (commit mode)
+        if: steps.detect.outputs.changed == 'true' && steps.detect.outputs.resolved_commit == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'file-sync-stage' '*') -Destination $env:GITHUB_WORKSPACE -Recurse -Force
+
+      - name: Create or update PR
+        if: steps.detect.outputs.changed == 'true' && steps.detect.outputs.resolved_commit == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: ${{ steps.detect.outputs.resolved_pr_branch }}
+          commit-message: "${{ steps.detect.outputs.resolved_pr_title_prefix }}: update ${{ steps.detect.outputs.changed_count }} file(s)"
+          title: "${{ steps.detect.outputs.resolved_pr_title_prefix }}: update ${{ steps.detect.outputs.changed_count }} file(s)"
+          body: |
+            Automated file sync.
+
+            Changed file(s):
+            ${{ steps.detect.outputs.changed_paths }}
+
+            ${{ steps.detect.outputs.resolved_pr_body_extra }}
+          add-paths: |
+            ${{ steps.detect.outputs.changed_paths }}
+          signoff: true
+          delete-branch: true

@@ -1,54 +1,113 @@
-# Windows SDK UCRT header sync (template)
+# Generic file sync workflow (template)
 
-This template repository contains a reusable GitHub Actions workflow that detects changes in selected Windows SDK UCRT headers on a Windows runner and proposes a pull request to update them in your repository.
+This template repository provides a **generic GitHub Actions workflow** that copies (or generates then copies) files from the runner file system into your repository, either:
 
-Important: Review the license terms for any SDK headers before committing them to a public repository. By default, this workflow does not commit changes; it only uploads the headers as a build artifact. You must explicitly enable commit mode if you have the rights to redistribute these files.
+1. As a downloadable artifact (review-only mode), or
+2. As a pull request with committed changes (commit mode).
+
+It is useful for:
+
+- Capturing SDK / tool output headers, schemas, OpenAPI specs, generated code, license inventories, etc.
+- Normalizing / refreshing vendored third‑party text files.
+- Periodically syncing externally generated metadata into your repo on a schedule.
+
+By default it **does not commit** anything. You must explicitly enable commit mode via an input or repository variable.
+
+> Always ensure you have redistribution rights for any files you commit from a hosted runner.
 
 ## What it does
 
-- Locates the latest installed Windows 10 SDK on the `windows-latest` runner.
-- Looks for these UCRT headers: `io.h`, `corecrt_io.h`, `corecrt_share.h`, `corecrt_wio.h`.
-- Compares their hashes to any copies in `docs/` in your repo.
-- If different or missing, uploads the new headers as an artifact.
-- Optionally (when enabled) stages the changed headers into `docs/` and opens/updates a PR using `peter-evans/create-pull-request`.
+- Accepts a newline‑separated list of source file paths and/or glob patterns (`sources`).
+- Expands globs and collects the matching files on the runner.
+- Hash‑compares each candidate with the existing copy under a destination directory in your repo (default: `docs/`).
+- Stages only changed / new files into a temporary folder.
+- Publishes them as an artifact (`synced-files`).
+- Optionally (commit mode) copies them into the repo working tree and opens/updates a PR using `peter-evans/create-pull-request`.
 
-## Repository structure
+## Inputs (workflow_dispatch)
+
+| Input | Purpose | Default |
+|-------|---------|---------|
+| `sources` | Newline separated file paths or globs evaluated on the runner. | (none) |
+| `dest-dir` | Destination directory (relative to repo root). | `docs` |
+| `preserve-dirs` | `true` to preserve directory structure relative to `base-dir`. | `false` |
+| `base-dir` | Base path stripped when preserving directory structure. | (none) |
+| `commit` | `true` to commit via PR. | `false` |
+| `pr-branch` | Branch name for PR. | `file-sync` |
+| `pr-title` | PR title prefix. | `File sync update` |
+| `pr-body-extra` | Extra body text appended to PR. | (none) |
+
+## Repository variables (fallbacks)
+
+You can set these in: Settings → Secrets and variables → Variables. Each maps to the input of the same semantic meaning and is used when the dispatch input is empty:
+
+- `SYNC_SOURCES`
+- `FILE_SYNC_DEST_DIR`
+- `FILE_SYNC_PRESERVE_DIRS`
+- `FILE_SYNC_BASE_DIR`
+- `FILE_SYNC_COMMIT`
+- `FILE_SYNC_PR_BRANCH`
+- `FILE_SYNC_PR_TITLE`
+- `FILE_SYNC_PR_BODY_EXTRA`
+
+## Enabling commit mode
+
+Either:
+
+1. Provide the input `commit: true` in a manual dispatch, or
+2. Set repository variable `FILE_SYNC_COMMIT=true`.
+
+The workflow (when changes exist) will:
+
+- Copy changed files into the working tree.
+- Open or update a PR on the configured branch (default `file-sync`).
+- Include only changed file paths in the PR.
+
+## Adding a generation step
+
+If the files need to be generated first (e.g., run a tool that outputs JSON or headers), add a step **before** the "Resolve sources and detect changes" step in your copy of the workflow. Example:
+
+```yaml
+		- name: Generate OpenAPI
+			run: |
+				./scripts/build-openapi.sh > output/openapi.json
+			shell: bash
+
+		- name: Sync generated spec
+			uses: ./.github/workflows/file-sync.yml  # if extracted into a reusable workflow
+```
+
+Point your `sources` at `output/openapi.json` (or a glob like `output/*.json`).
+
+## Usage quick start
+
+1. Copy `file-sync.yml` into your repo. It should be stored in `.github\workflows\`
+2. Commit & push.
+3. (Optional) Set repository variable `SYNC_SOURCES` to something like:
 
 ```
-.github/workflows/header-sync.yml   # The workflow
-README.md                           # This file
+C:\\Program Files (x86)\\Windows Kits\\10\\Include\\**\\ucrt\\*.h
 ```
 
-## Usage
+4. Manually dispatch the workflow or wait for the scheduled run.
+5. Download the `synced-files` artifact to inspect changes.
+6. Enable commit mode once you're satisfied.
 
-1. Copy the `.github/workflows/header-sync.yml` file into your repository.
-2. Commit and push.
-3. By default, the workflow runs weekly and also supports manual dispatch.
-4. The workflow will upload an artifact `sdk-ucrt-headers` when changes are detected.
+## Customization notes
 
-### Enable commit mode (optional)
+- The workflow currently runs on `windows-latest` (PowerShell 7 is used). PowerShell is cross‑platform; you can adapt `runs-on: ubuntu-latest` if your paths are Linux style.
+- Globs are expanded with `Get-ChildItem -Recurse`; adjust if you need directory exclusions.
+- Only added / changed files are considered. Deletions (files that existed previously but no longer match) are not removed automatically (you can add a cleanup step if required).
+- Commit messages & PR title use your supplied title plus a count of changed files.
 
-If you are permitted to commit these headers into your repo, set a repository variable to enable commit mode:
+## Limitations / Caveats
 
-- Repository Settings → Secrets and variables → Variables
-- Add variable `HEADER_SYNC_COMMIT` with value `true`
+- Very large file sets may increase run time; prefer targeted globs.
+- Binary files are supported (hash compare) but line-level diffs in PR will be less readable.
+- If both an input and variable are set for the same concept, the input wins.
+- Deletions are not yet auto-pruned (future enhancement idea: optional `delete-missing` flag).
 
-On the next run, the workflow will:
-- Copy changed headers into `docs/`
-- Open or update a PR on branch `header-sync`
+## License & attribution
 
-## Customization
+Distributed under the MIT License (see `LICENSE`).
 
-- To change which headers are tracked, edit the `$targetNames` list in the PowerShell step.
-- To point at a different SDK root, adjust `$kitsRoot` (defaults to `C:\Program Files (x86)\Windows Kits\10\Include`).
-- To change the PR branch name or the commit message, update the `create-pull-request` step inputs.
-
-## Why not upload-artifact only?
-
-- `actions/upload-artifact` is used here to make the updated headers available for review without committing. This avoids licensing issues for public repositories.
-- If you enable commit mode, the workflow uses `peter-evans/create-pull-request` to commit and open a PR in a clean, idempotent way (no manual `git push` or duplicate PRs when re-run).
-
-## Caveats
-
-- The exact header locations on the runner can change; the workflow searches the installed Windows 10 SDK and chooses the highest version that includes `ucrt/`.
-- The workflow requires `contents` and `pull-requests` write permissions only when commit mode is enabled.
